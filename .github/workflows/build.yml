@@ -1,0 +1,241 @@
+name: Build Axon APK
+on: [push, workflow_dispatch]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+      - name: Write project files
+        run: |
+          mkdir -p app/src/main/java/com/axon/booster app/src/main/assets
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = 'Axon'
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+            id 'com.android.application' version '8.2.2' apply false
+            id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+          echo "android.useAndroidX=true" > gradle.properties
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
+          android {
+            namespace 'com.axon.booster'
+            compileSdk 34
+            defaultConfig { applicationId 'com.axon.booster'; minSdk 26; targetSdk 33; versionCode 1; versionName '1.0' }
+            compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+            kotlinOptions { jvmTarget = '17' }
+          }
+          dependencies {
+            implementation 'dev.rikka.shizuku:api:13.1.5'
+            implementation 'dev.rikka.shizuku:provider:13.1.5'
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="moe.shizuku.manager.permission.API_V23"/>
+            <queries><package android:name="moe.shizuku.privileged.api"/></queries>
+            <application android:label="Axon" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+              <provider android:name="rikka.shizuku.ShizukuProvider" android:authorities="${applicationId}.shizuku" android:multiprocess="false" android:enabled="true" android:exported="true" android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"/>
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/axon/booster/MainActivity.kt <<'EOF'
+          package com.axon.booster
+
+          import android.app.Activity
+          import android.app.ActivityManager
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.StatFs
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebView
+          import org.json.JSONObject
+          import rikka.shizuku.Shizuku
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+            lateinit var web: WebView
+
+            override fun onCreate(b: Bundle?) {
+              super.onCreate(b)
+              web = WebView(this)
+              web.setBackgroundColor(0xFF000000.toInt())
+              web.settings.javaScriptEnabled = true
+              web.settings.domStorageEnabled = true
+              web.addJavascriptInterface(Bridge(), "Android")
+              web.loadUrl("file:///android_asset/index.html")
+              setContentView(web)
+            }
+
+            fun sh(c: String): String {
+              val m = Shizuku::class.java.getDeclaredMethod("newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java)
+              m.isAccessible = true
+              val p = m.invoke(null, arrayOf("sh", "-c", "($c) 2>&1"), null, null) as Process
+              val o = p.inputStream.bufferedReader().readText()
+              p.waitFor()
+              return o.trim()
+            }
+
+            fun mhz(): Int = try { java.io.File("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq").readText().trim().toInt() / 1000 } catch (e: Throwable) { -1 }
+
+            fun anim(v: String) = "settings put global window_animation_scale $v; settings put global transition_animation_scale $v; settings put global animator_duration_scale $v"
+
+            fun act(id: String, undo: Boolean): String = when (id) {
+              "anim" -> sh(anim(if (undo) "1.0" else "0.5"))
+              "killbg" -> sh("am kill-all")
+              "trim" -> sh("pm trim-caches 999999999999")
+              "dexopt" -> sh("cmd package bg-dexopt-job")
+              "batt" -> sh("settings put global low_power 0")
+              "perf" -> sh("cmd power set-fixed-performance-mode-enabled ${!undo}")
+              "dnd" -> sh("cmd notification set_dnd ${if (undo) "off" else "priority"}")
+              "res" -> if (undo) sh("wm size reset; wm density reset") else {
+                val s = Regex("(\\d+)x(\\d+)").find(sh("wm size"))
+                val d = Regex("(\\d+)").find(sh("wm density").substringAfter("Physical density:"))
+                if (s == null || d == null) "Could not read screen info"
+                else sh("wm size ${s.groupValues[1].toInt() * 3 / 4}x${s.groupValues[2].toInt() * 3 / 4}; wm density ${d.groupValues[1].toInt() * 3 / 4}")
+              }
+              "list" -> sh("pm list packages -3")
+              else -> if (id.startsWith("launch:") && Regex("[A-Za-z0-9_.]+").matches(id.substring(7))) sh("monkey -p " + id.substring(7) + " -c android.intent.category.LAUNCHER 1") else "Unknown action"
+            }.ifEmpty { "OK" }
+
+            inner class Bridge {
+              @JavascriptInterface fun status(): String {
+                val mi = ActivityManager.MemoryInfo()
+                (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mi)
+                val bi = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                val sf = StatFs(Environment.getDataDirectory().path)
+                val sz = try {
+                  if (!Shizuku.pingBinder()) 0
+                  else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) 2 else 1
+                } catch (e: Throwable) { 0 }
+                return JSONObject().put("ramFree", mi.availMem shr 20).put("ramTotal", mi.totalMem shr 20)
+                  .put("temp", (bi?.getIntExtra("temperature", 0) ?: 0) / 10.0)
+                  .put("bat", bi?.getIntExtra("level", 0) ?: 0)
+                  .put("disk", sf.availableBytes / 1e9).put("shizuku", sz).put("model", Build.MODEL).put("mhz", mhz()).toString()
+              }
+
+              @JavascriptInterface fun grant() { try { Shizuku.requestPermission(1) } catch (e: Throwable) {} }
+
+              @JavascriptInterface fun openShizuku() {
+                val i = packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
+                  ?: Intent(Intent.ACTION_VIEW, Uri.parse("https://shizuku.rikka.app/download/"))
+                startActivity(i)
+              }
+
+              @JavascriptInterface fun run(id: String, undo: Boolean) {
+                thread {
+                  val out = try { act(id, undo) } catch (e: Throwable) { "Error: " + (e.cause?.message ?: e.message) }
+                  runOnUiThread { web.evaluateJavascript("done(" + JSONObject.quote(id) + "," + JSONObject.quote(out.take(6000)) + ")", null) }
+                }
+              }
+            }
+          }
+          EOF
+          cat > app/src/main/assets/index.html <<'EOF'
+          <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+          <style>
+          :root{--card:#101014;--bd:#3b1659;--mg:#d500f9;--cy:#17d4e6;--tx:#f5f3fa;--mu:#8e8aa0}
+          *{box-sizing:border-box;margin:0}html,body{height:100%}
+          body{background:#000;color:var(--tx);font-family:system-ui,sans-serif;overflow:hidden}
+          .scr{display:none;height:100%;overflow-y:auto;padding:18px 16px 130px}.scr.on{display:block}
+          .top{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+          .av{position:relative;width:48px;height:48px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#ff7bf0,#6a1bb5 70%);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:20px;flex:0 0 auto}
+          .av em{position:absolute;bottom:-6px;left:8px;background:#ffd400;color:#000;font:800 9px system-ui;padding:2px 6px;border-radius:4px;font-style:normal}
+          h1{font-size:20px;font-weight:800}small{color:var(--mg);font-size:11px;font-weight:600}
+          .card{background:var(--card);border:1px solid var(--bd);border-radius:22px;padding:14px;margin-bottom:12px}
+          .lb{font-size:10px;color:var(--mu);font-weight:700;letter-spacing:.5px}
+          .ring{position:relative;width:230px;height:230px;margin:6px auto 16px;border-radius:50%;box-shadow:0 0 0 14px #06151a;border:0;background:radial-gradient(circle,#032a30,#000 70%);display:block;color:var(--tx)}
+          .ring svg{position:absolute;inset:0;transform:rotate(-90deg)}.ring div{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+          .ring b{font-size:42px;font-weight:800}.ring i{font-style:normal;color:var(--cy);font-weight:600;font-size:14px}.ring span{font-size:10px;color:#4d6f73;margin-top:6px}
+          .g2{display:grid;grid-template-columns:1fr 1fr;gap:12px}.g2 .card b{display:block;font-size:22px;margin-top:8px;color:var(--cy)}
+          .row3{display:flex;justify-content:space-around;text-align:center;margin-bottom:10px}.row3 b{display:block;color:var(--cy);font-size:13px;margin-top:6px}
+          .qb{position:relative;height:150px;border-radius:24px;border:1px solid var(--bd);overflow:hidden;margin:4px 0 12px;width:100%;display:block;color:var(--tx);background:radial-gradient(circle at 75% 25%,#d500f9 0,transparent 45%),radial-gradient(circle at 20% 80%,#17d4e6 0,transparent 40%),linear-gradient(135deg,#1b0630,#050509)}
+          .qb div{position:absolute;inset:auto 0 18px;text-align:center}.qb b{display:block;font-size:24px;font-weight:800}.qb span{font-size:12px;color:var(--cy);font-weight:800}
+          .seg{display:flex;background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:5px;margin-bottom:12px}
+          .seg button{flex:1;background:none;border:0;color:var(--mu);font:800 11px system-ui;padding:11px 0;border-radius:12px}.seg button.on{background:#2a0a42;color:var(--tx);box-shadow:inset 0 0 0 1px var(--mg)}
+          button{font-family:inherit;cursor:pointer}
+          nav{position:fixed;left:12px;right:12px;bottom:calc(14px + env(safe-area-inset-bottom,0px));height:66px;background:rgba(14,14,20,.97);border:1px solid #262630;border-radius:33px;display:flex;align-items:center;justify-content:space-around;z-index:5}
+          nav .t{background:none;border:0;color:var(--mu);font:600 10px system-ui;display:flex;flex-direction:column;align-items:center;gap:3px;width:56px}nav .t span{font-size:19px}nav .t.on{color:var(--tx)}
+          nav .c{width:76px;height:76px;margin-top:-26px;border-radius:50%;background:#0a0212;border:2px solid var(--mg);color:var(--mg);font-size:30px;box-shadow:0 0 22px rgba(213,0,249,.35)}
+          .hd{display:flex;align-items:center;gap:12px;margin-bottom:12px}.ct{font-size:20px;font-weight:800;color:var(--mg);flex:1}
+          .sec{font-size:11px;color:var(--mu);font-weight:800;margin:16px 0 10px}
+          .tg{display:flex;justify-content:space-between;align-items:center;gap:10px;background:var(--card);border-radius:18px;padding:16px;margin-bottom:10px}.tg b{font-size:14px;display:block}.tg span{font-size:11px;color:var(--mu)}
+          .sw{position:relative;width:56px;height:32px;flex:0 0 auto}.sw input{position:absolute;inset:0;width:100%;height:100%;opacity:0;margin:0}
+          .sw i{position:absolute;inset:0;border:2px solid #55555f;border-radius:99px;background:#26262c;pointer-events:none}.sw i:after{content:'';position:absolute;left:5px;top:5px;width:18px;height:18px;border-radius:50%;background:#8a8a94;transition:.15s}
+          .sw input:checked+i{background:#3a0b55;border-color:var(--mg)}.sw input:checked+i:after{left:27px;background:var(--mg)}
+          .rb,.gm button{background:#2a0a42;border:1px solid var(--mg);color:#fff;font:800 11px system-ui;padding:10px 12px;border-radius:12px}
+          .mc{border-radius:26px;text-align:center;padding:20px;font-weight:800;font-size:15px;background:#0b0b10;border:1px solid var(--bd);margin-bottom:10px}.mc div{font-size:24px;color:var(--mg)}
+          .rv{display:block;margin:0 0 12px auto;background:#2a0508;border:1px solid #5a1118;color:#ff4d5a;font:800 11px system-ui;padding:10px 14px;border-radius:12px}
+          #diag{height:250px;overflow:auto;background:#050507;border:1px solid #1f1f27;border-radius:20px;padding:16px;font-size:13px;font-weight:600;color:var(--cy);line-height:1.8;margin:8px 0 14px;white-space:pre-wrap}
+          .chips{display:flex;gap:10px;overflow-x:auto;margin-bottom:12px}.chips button{flex:0 0 auto;background:#0e0e14;border:1px solid var(--bd);color:var(--tx);font:700 12px system-ui;padding:12px 14px;border-radius:14px}
+          .inp{border:2px solid var(--mg);border-radius:18px;background:#08080c;margin-bottom:12px}.inp input{width:100%;background:none;border:0;color:var(--tx);font:14px system-ui;padding:17px 14px}
+          input:focus{outline:none}
+          .big{width:100%;border:0;border-radius:18px;padding:17px;background:var(--mg);color:#fff;font:800 15px system-ui}
+          .gm{display:flex;align-items:center;gap:12px;background:var(--card);border-radius:18px;padding:12px;margin-bottom:10px}.gm .ic{width:44px;height:44px;border-radius:12px;background:linear-gradient(135deg,var(--mg),var(--cy));display:flex;align-items:center;justify-content:center;font-weight:800}
+          .gm .n{flex:1;min-width:0}.gm b{font-size:14px;display:block}.gm span{font-size:10px;color:var(--mu);word-break:break-all}
+          .gs{width:100%;background:var(--card);border:1px solid var(--bd);border-radius:14px;color:var(--tx);padding:13px;font-size:14px;margin:10px 0}
+          .ov{position:fixed;inset:0;background:rgba(0,0,0,.8);display:none;align-items:center;justify-content:center;padding:22px;z-index:9}.ov.on{display:flex}
+          .term{width:100%;height:400px;background:#000;border:1px solid #176a74;border-radius:24px;padding:20px;display:flex;flex-direction:column}
+          .term h4{color:var(--cy);font-size:12px;margin-bottom:12px;display:flex;justify-content:space-between}.term h4 button{background:none;border:0;color:var(--mu);font-size:12px}
+          #tt{flex:1;overflow:auto;font:11px monospace;line-height:1.9;color:#dff}
+          .bar{height:4px;background:#1b2a2d;border-radius:4px;margin-top:10px}.bar i{display:block;height:100%;width:0;background:var(--cy);transition:width .4s}
+          .toast{position:fixed;left:20px;right:20px;top:calc(14px + env(safe-area-inset-top,0px));background:#1a0a28;border:1px solid var(--mg);border-radius:14px;padding:12px;font-size:12px;font-weight:600;z-index:12;opacity:0;pointer-events:none;transition:.25s}.toast.on{opacity:1}
+          .note{font-size:10px;color:var(--mu);text-align:center}
+          </style></head><body>
+          <div class="toast" id="toast"></div>
+          <section class="scr on" id="s0">
+           <div class="top"><div class="av">A<em>ELITE</em></div><div><h1>AXON AI ENGINE</h1><small id="mdl">Shizuku edition</small></div></div>
+           <div class="card" id="szc" style="display:none"><div id="szt" class="lb" style="font-size:12px;line-height:1.5"></div><button class="rb" id="szb" style="margin-top:10px"></button></div>
+           <button class="ring" id="ring" aria-label="Memory ring, tap to change color">
+            <svg viewBox="0 0 230 230" width="230" height="230"><circle cx="115" cy="115" r="100" fill="none" stroke="#06353b" stroke-width="9"/><circle id="arc" cx="115" cy="115" r="100" fill="none" stroke="#17d4e6" stroke-width="9" stroke-linecap="round" stroke-dasharray="628" stroke-dashoffset="628"/></svg>
+            <div><span class="lb">MEMORY IN USE</span><b id="pc">--</b><i id="fr">--</i><span id="cpu">Tap to change color</span></div></button>
+           <div class="g2"><div class="card"><div class="lb">BATTERY TEMP</div><b id="tmp">--</b></div><div class="card"><div class="lb">FREE STORAGE</div><b id="dsk">--</b></div></div>
+           <div class="card"><div class="row3"><div><div class="lb">BATTERY</div><b id="bat">--</b></div><div><div class="lb">SHIZUKU</div><b id="szs">--</b></div><div><div class="lb">APPS</div><b id="na">--</b></div></div>
+            <div class="lb">FREE RAM (LIVE)</div><svg viewBox="0 0 200 50" width="100%" height="60" preserveAspectRatio="none"><polyline id="gr" fill="none" stroke="#17d4e6" stroke-width="2" points=""/></svg></div>
+           <button class="qb" id="qb"><div><b>QUICK BOOST</b><span>RUNS REAL TWEAKS</span></div></button>
+           <div class="seg" id="mode"><button class="on">GAMING</button><button>SMOOTH</button><button>BALANCED</button></div>
+           <p class="note">Real commands via Shizuku. CPU and GPU clocks need root and are not changed.</p>
+          </section>
+          <section class="scr" id="s1"><div class="hd"><div class="ct">PERFORMANCE TUNER</div></div><div id="tl"></div></section>
+          <section class="scr" id="s2">
+           <div class="hd"><div class="ct">AXON CORE AI</div></div>
+           <div class="mc"><div>✦</div>AXON RULES ENGINE ACTIVE</div>
+           <button class="rv" id="rv">↩ REVERT LAST TUNING</button>
+           <div class="lb">DIAGNOSTIC STREAM</div><div id="diag" aria-live="polite"></div>
+           <div class="chips" id="chips"></div>
+           <div class="inp"><input id="cmd" placeholder="Ask AXON to optimize system..." autocomplete="off" enterkeyhint="send"></div>
+           <button class="big" id="auto">▣ ENGAGE AUTO-TUNE</button>
+          </section>
+          <section class="scr" id="s3">
+           <div class="hd"><div class="ct">GAME LOBBY</div></div>
+           <p class="lb">Pick a game. Axon applies the FPS tweaks, then opens it.</p>
+           <button class="big" id="load" style="margin-top:12px">LOAD MY APPS</button>
+           <input class="gs" id="gs" placeholder="Search apps..." autocomplete="off"><div id="gl"></div>
+          </section>
+          <nav><button class="t on" data-g="0"><span>📊</span>Stats</button><button class="t" data-g="1"><span>🎚</span>Tuner</button><button class="c" id="mid" aria-label="Quick boost">✦</button><button class="t" data-g="2"><span>💬</span>Chat</button><button class="t" data-g="3"><span>🎮</span>Lobby</button></nav>
+          <div class="ov" id="ov"><div class="term"><h4><span>▣ BOOST TERMINAL</span><button id="hide">Hide</button></h4><div id="tt"></div><div class="bar"><i id="pb"></i></div></div></div>
+          <script>
+          const $=i=>document.getElementById(i),A=window.Android;
+          const TW=[['anim','Faster animations','Window and transition speed 0.5x',1],['res','Lower resolution to 75%','Fewer pixels, real FPS gain in games',1],['perf','Fixed performance mode','Only if your ROM supports it',1],['dnd','Do Not Disturb','No pop-ups while gaming',1],['batt','Battery Saver off','Saver throttles the CPU',0],['killbg','Close background apps','Frees RAM now',0],['trim','Clear app caches','Frees storage',0],['dexopt','Optimize apps
